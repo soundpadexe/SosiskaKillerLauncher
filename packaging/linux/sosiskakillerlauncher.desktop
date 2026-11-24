@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=SosiskaKillerLauncher
+Comment=Minecraft launcher
+Exec=sosiskakillerlauncher
+Icon=sosiskakillerlauncher
+Terminal=false
+Categories=Game;

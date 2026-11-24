@@ -1,0 +1,59 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release
+      - run: cargo build --release
+      - name: Installer
+        shell: pwsh
+        run: |
+          $env:SKL_VERSION = "${{ github.ref_name }}".TrimStart("v")
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\skl.iss
+          Copy-Item target\release\SosiskaKillerLauncher.exe dist\SosiskaKillerLauncher-portable.exe
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: dist/* }
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libgl1-mesa-dev
+      - run: cargo test --release
+      - run: cargo build --release
+      - name: Packages
+        run: |
+          V="${GITHUB_REF_NAME#v}"; mkdir -p dist
+          T=SosiskaKillerLauncher-linux-x86_64; mkdir $T
+          cp target/release/SosiskaKillerLauncher $T/sosiskakillerlauncher
+          cp packaging/skl.png $T/sosiskakillerlauncher.png
+          cp packaging/linux/* $T/ && chmod +x $T/install.sh
+          tar czf dist/$T.tar.gz $T
+          D=deb/usr; mkdir -p $D/bin $D/share/applications $D/share/icons/hicolor/256x256/apps deb/DEBIAN
+          cp target/release/SosiskaKillerLauncher $D/bin/sosiskakillerlauncher
+          cp packaging/linux/sosiskakillerlauncher.desktop $D/share/applications/
+          cp packaging/skl.png $D/share/icons/hicolor/256x256/apps/sosiskakillerlauncher.png
+          printf 'Package: sosiskakillerlauncher\nVersion: %s\nArchitecture: amd64\nMaintainer: SKL\nDepends: libgtk-3-0, libgl1, libxkbcommon0\nDescription: SLAVA UKRAINI\n' "${V:-0.1.0}" > deb/DEBIAN/control
+          dpkg-deb --build --root-owner-group deb dist/sosiskakillerlauncher_${V:-0.1.0}_amd64.deb
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: dist/* }
+  release:
+    needs: [windows, linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: "SLAVA UKAINSDAFGLAUCNHER"
