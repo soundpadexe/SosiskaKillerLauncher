@@ -37,6 +37,11 @@ impl Paths {
     pub fn root(&self) -> &Path {
         &self.root
     }
+    /// Microsoft sign-in tokens (kept out of settings.json).
+    pub fn account_file(&self) -> PathBuf {
+        self.root().join("account.json")
+    }
+
     pub fn settings_file(&self) -> PathBuf {
         self.root.join("settings.json")
     }

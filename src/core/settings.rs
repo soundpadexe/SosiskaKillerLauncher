@@ -24,6 +24,14 @@ impl ThemePreset {
     }
 }
 
+/// Offline ("pirate") nickname or a licensed Microsoft account.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccountMode {
+    #[default]
+    Offline,
+    Microsoft,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WallpaperSource {
     Builtin(u8),
@@ -40,6 +48,10 @@ pub struct Settings {
     pub dim: f32,
     pub wallpaper: WallpaperSource,
     pub nickname: String,
+    pub account_mode: AccountMode,
+    /// Skin model / URL of the *other* account mode (swapped on mode change).
+    pub skin_slim_alt: bool,
+    pub skin_url_alt: Option<String>,
     pub selected_instance: Option<String>,
     pub ui_scale: f32,
     pub reduce_motion: bool,
@@ -70,6 +82,9 @@ impl Default for Settings {
             dim: 0.35,
             wallpaper: WallpaperSource::Builtin(0),
             nickname: "Player".into(),
+            account_mode: AccountMode::Offline,
+            skin_slim_alt: false,
+            skin_url_alt: None,
             selected_instance: None,
             ui_scale: 1.0,
             reduce_motion: false,

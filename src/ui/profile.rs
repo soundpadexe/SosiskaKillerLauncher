@@ -10,7 +10,7 @@ use super::widgets::{ghost_button, lerp_color, play_button, segmented, ButtonSta
 use crate::api::skins::{CapeItem, SkinItem};
 use crate::core::auth::{is_valid_nickname, offline_uuid};
 use crate::core::i18n::{t, Lang, K};
-use crate::core::settings::Settings;
+use crate::core::settings::{AccountMode, Settings};
 
 /// Well-known profiles shown before the first cape search.
 pub const POPULAR_CAPE_OWNERS: [&str; 6] = ["jeb_", "Dinnerbone", "Grumm", "Searge", "deadmau5", "Marc"];
@@ -38,8 +38,23 @@ pub struct Shop {
     capes_started: bool,
 }
 
+/// What the profile page needs to know about the Microsoft sign-in.
+#[derive(Default)]
+pub struct MsView {
+    /// Signed-in account: (name, dashed uuid).
+    pub account: Option<(String, String)>,
+    /// Pending device-code login: (user code, page URL); `Some(None)` = still requesting a code.
+    pub pending: Option<Option<(String, String)>>,
+    pub uploading: bool,
+}
+
 pub enum ProfileAction {
     None,
+    SetMode(AccountMode),
+    MsLogin,
+    MsCancel,
+    MsLogout,
+    OpenUrl(String),
     PickSkin,
     PickCape,
     ClearSkin,
@@ -133,6 +148,7 @@ pub fn show(
     shop: &mut Shop,
     skin_icons: &mut Icons,
     cape_icons: &mut Icons,
+    ms: &MsView,
 ) -> ProfileAction {
     let mut action = ProfileAction::None;
     let ctx = ui.ctx().clone();
@@ -191,7 +207,7 @@ pub fn show(
     });
     let body = Rect::from_min_max(pos2(col.left(), tabs_r.bottom() + 16.0), col.max);
     match shop.tab {
-        0 => my_skin(ui, pal, lang, s, skin.is_some(), cape.is_some(), body, &mut action),
+        0 => my_skin(ui, pal, lang, s, ms, skin.is_some(), cape.is_some(), body, &mut action),
         1 => catalog(ui, pal, lang, shop, skin_icons, body, now, &mut action),
         _ => capes(ui, pal, lang, shop, cape_icons, body, now, &mut action),
     }
@@ -217,18 +233,29 @@ fn input(ui: &mut Ui, pal: &Palette, id: &str, text: &mut String, hint: &str, wi
 }
 
 #[allow(clippy::too_many_arguments)]
-fn my_skin(ui: &mut Ui, pal: &Palette, lang: Lang, s: &mut Settings, has_skin: bool, has_cape: bool, body: Rect, action: &mut ProfileAction) {
+fn my_skin(ui: &mut Ui, pal: &Palette, lang: Lang, s: &mut Settings, ms: &MsView, has_skin: bool, has_cape: bool, body: Rect, action: &mut ProfileAction) {
     let ctx = ui.ctx().clone();
+    let licensed = s.account_mode == AccountMode::Microsoft;
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(body), |ui| {
         ui.set_opacity(appear(&ctx, 0.12, 0.6));
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            section(ui, pal, t(lang, K::Nickname));
-            input(ui, pal, "profile_nick", &mut s.nickname, "", 300.0, 16);
-            ui.add_space(6.0);
-            if is_valid_nickname(&s.nickname) {
-                ui.label(RichText::new(offline_uuid(&s.nickname)).monospace().size(11.0).color(pal.text_dim));
+            section(ui, pal, t(lang, K::AccountType));
+            let mut m = usize::from(licensed);
+            if segmented(ui, pal, "account_mode", &[t(lang, K::Pirate), t(lang, K::Licensed)], &mut m, false) {
+                *action = ProfileAction::SetMode(if m == 1 { AccountMode::Microsoft } else { AccountMode::Offline });
+            }
+            ui.add_space(16.0);
+            if licensed {
+                microsoft_block(ui, pal, lang, ms, action);
             } else {
-                ui.label(RichText::new(t(lang, K::NicknameInvalid)).size(12.0).color(pal.danger));
+                section(ui, pal, t(lang, K::Nickname));
+                input(ui, pal, "profile_nick", &mut s.nickname, "", 300.0, 16);
+                ui.add_space(6.0);
+                if is_valid_nickname(&s.nickname) {
+                    ui.label(RichText::new(offline_uuid(&s.nickname)).monospace().size(11.0).color(pal.text_dim));
+                } else {
+                    ui.label(RichText::new(t(lang, K::NicknameInvalid)).size(12.0).color(pal.danger));
+                }
             }
 
             ui.add_space(22.0);
@@ -244,6 +271,11 @@ fn my_skin(ui: &mut Ui, pal: &Palette, lang: Lang, s: &mut Settings, has_skin: b
             });
             ui.add_space(4.0);
             ui.label(RichText::new(t(lang, K::SkinFormats)).size(11.5).color(pal.text_dim));
+            if licensed {
+                ui.add_space(4.0);
+                let note = if ms.uploading { format!("{} …", t(lang, K::MsSkinNote)) } else { t(lang, K::MsSkinNote).to_owned() };
+                ui.label(RichText::new(note).size(11.5).color(pal.accent));
+            }
             ui.add_space(10.0);
             ui.label(RichText::new(t(lang, K::Model)).size(13.0).color(pal.text));
             ui.add_space(4.0);
@@ -264,7 +296,10 @@ fn my_skin(ui: &mut Ui, pal: &Palette, lang: Lang, s: &mut Settings, has_skin: b
                 }
             });
             ui.add_space(4.0);
-            ui.label(RichText::new(t(lang, K::CapeLocalNote)).size(11.5).color(pal.text_dim));
+            ui.label(RichText::new(t(lang, if licensed { K::MsCapeNote } else { K::CapeLocalNote })).size(11.5).color(pal.text_dim));
+            if licensed {
+                return; // a licensed skin is already visible to everyone
+            }
 
             ui.add_space(22.0);
             section(ui, pal, t(lang, K::ForEveryone));
@@ -280,6 +315,55 @@ fn my_skin(ui: &mut Ui, pal: &Palette, lang: Lang, s: &mut Settings, has_skin: b
             }
         });
     });
+}
+
+fn microsoft_block(ui: &mut Ui, pal: &Palette, lang: Lang, ms: &MsView, action: &mut ProfileAction) {
+    section(ui, pal, "Microsoft");
+    if let Some((name, uuid)) = &ms.account {
+        ui.label(RichText::new(name).size(18.0).color(pal.text).strong());
+        ui.label(RichText::new(uuid).monospace().size(11.0).color(pal.text_dim));
+        ui.add_space(8.0);
+        if ghost_button(ui, pal, t(lang, K::MsSignOut)).clicked() {
+            *action = ProfileAction::MsLogout;
+        }
+        return;
+    }
+    match &ms.pending {
+        None => {
+            ui.label(RichText::new(t(lang, K::MsSignInDesc)).size(12.0).color(pal.text_dim));
+            ui.add_space(8.0);
+            if ghost_button(ui, pal, t(lang, K::MsSignIn)).clicked() {
+                *action = ProfileAction::MsLogin;
+            }
+        }
+        Some(code) => {
+            if let Some((code, url)) = code {
+                ui.label(RichText::new(t(lang, K::MsCode)).size(12.0).color(pal.text_dim));
+                ui.label(RichText::new(code).monospace().size(30.0).color(pal.text).strong());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if ghost_button(ui, pal, t(lang, K::MsOpenPage)).clicked() {
+                        *action = ProfileAction::OpenUrl(url.clone());
+                    }
+                    if ghost_button(ui, pal, t(lang, K::Copy)).clicked() {
+                        *action = ProfileAction::Copy(code.clone());
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(RichText::new(url).monospace().size(11.0).color(pal.text_dim));
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.add(egui::Spinner::new().size(14.0).color(pal.accent));
+                ui.label(RichText::new(t(lang, K::MsWaiting)).size(12.0).color(pal.text_dim));
+                if ghost_button(ui, pal, t(lang, K::Cancel)).clicked() {
+                    *action = ProfileAction::MsCancel;
+                }
+            });
+        }
+    }
 }
 
 fn command_box(ui: &mut Ui, pal: &Palette, lang: Lang, cmd: &str, action: &mut ProfileAction) {

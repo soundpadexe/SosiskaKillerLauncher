@@ -380,7 +380,7 @@ mod live {
         let v = list.versions.iter().find(|v| v.id == inst.version).unwrap();
         let req = crate::core::launch::install::LaunchRequest {
             id: v.id.clone(), url: v.url.clone(), legacy: false, nickname: "Tester".into(),
-            uuid: crate::core::auth::offline_uuid("Tester"), memory_mb: 3072, game_dir: dir.clone(),
+            uuid: crate::core::auth::offline_uuid("Tester"), online: None, memory_mb: 3072, game_dir: dir.clone(),
             loader: inst.loader, loader_version: inst.loader_version.clone(), skin_port: None, opts: Default::default(),
         };
         let lp = crate::core::launch::Progress::new();

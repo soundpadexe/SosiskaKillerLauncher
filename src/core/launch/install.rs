@@ -24,6 +24,8 @@ pub struct LaunchRequest {
     pub legacy: bool,
     pub nickname: String,
     pub uuid: String,
+    /// Licensed account: (Minecraft access token, xuid). None = offline.
+    pub online: Option<(String, String)>,
     pub memory_mb: u32,
     /// Isolated instance folder used as `--gameDir`.
     pub game_dir: PathBuf,
@@ -228,11 +230,11 @@ pub async fn run(client: &reqwest::Client, paths: &Paths, req: &LaunchRequest, p
         ("game_assets", s(&game_assets)),
         ("assets_index_name", ai.id.clone()),
         ("auth_uuid", req.uuid.replace('-', "")),
-        ("auth_access_token", "0".into()),
-        ("auth_session", "0".into()),
-        ("auth_xuid", "0".into()),
+        ("auth_access_token", req.online.as_ref().map_or_else(|| "0".into(), |(t, _)| t.clone())),
+        ("auth_session", req.online.as_ref().map_or_else(|| "0".into(), |(t, _)| format!("token:{t}:{}", req.uuid.replace('-', "")))),
+        ("auth_xuid", req.online.as_ref().map_or_else(|| "0".into(), |(_, x)| x.clone())),
         ("clientid", "0".into()),
-        ("user_type", "legacy".into()),
+        ("user_type", if req.online.is_some() { "msa".into() } else { "legacy".into() }),
         ("user_properties", "{}".into()),
         ("version_type", vj.kind.clone()),
         ("natives_directory", s(&natives_dir)),
@@ -398,7 +400,7 @@ mod tests {
             url: v.url.clone(),
             legacy: v.era.is_legacy(),
             nickname: "Tester".into(),
-            uuid: crate::core::auth::offline_uuid("Tester"),
+            uuid: crate::core::auth::offline_uuid("Tester"), online: None,
             memory_mb: 2048,
             game_dir: paths.instances().join(format!("test-{id}")),
             skin_port: std::env::var("SKL_TEST_SKIN_PORT").ok().and_then(|p| p.parse().ok()),
@@ -466,7 +468,7 @@ mod guard_gate {
         let paths = crate::core::paths::Paths::init().unwrap();
         let req = super::LaunchRequest {
             id: "1.21.4".into(), url: "http://invalid.invalid/never-fetched".into(), legacy: false,
-            nickname: "Tester".into(), uuid: crate::core::auth::offline_uuid("Tester"), memory_mb: 1024,
+            nickname: "Tester".into(), uuid: crate::core::auth::offline_uuid("Tester"), online: None, memory_mb: 1024,
             game_dir: dir.clone(), loader: crate::core::instances::Loader::Fabric, skin_port: None, opts: Default::default(), loader_version: None,
         };
         let prog = super::Progress::new();

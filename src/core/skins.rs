@@ -6,8 +6,16 @@ use sha2::Digest;
 
 use super::paths::Paths;
 
+/// Licensed account skins live apart from the offline ones (`skins/msa/`).
+static MICROSOFT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn use_microsoft(on: bool) {
+    MICROSOFT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn dir(paths: &Paths) -> PathBuf {
-    paths.root().join("skins")
+    let base = paths.root().join("skins");
+    if MICROSOFT.load(std::sync::atomic::Ordering::Relaxed) { base.join("msa") } else { base }
 }
 
 

@@ -10,7 +10,8 @@ use crate::core::i18n::{t, K};
 use crate::core::instances::{self, Instance};
 use crate::core::launch::{install, Progress, Stage};
 use crate::core::paths::Paths;
-use crate::core::settings::{Settings, ThemePreset};
+use crate::core::msauth::{self, Account};
+use crate::core::settings::{AccountMode, Settings, ThemePreset};
 use crate::models::version::{Catalog, VersionList};
 use crate::ui::anim::{restart_entrance, set_motion, spring_reset};
 use crate::ui::cover::Covers;
@@ -53,6 +54,13 @@ enum ShopMsg {
     Page { req: u64, append: bool, res: anyhow::Result<(Vec<crate::api::skins::SkinItem>, Option<String>)> },
     Capes { req: u64, res: anyhow::Result<Vec<crate::api::skins::CapeItem>> },
     Applied { cape: bool, res: anyhow::Result<(Vec<u8>, Option<String>, String)> },
+}
+
+enum MsMsg {
+    Code { gen: u64, code: String, url: String },
+    /// Signed in: account + its current skin (PNG, slim) if it has a custom one.
+    Done { gen: u64, res: anyhow::Result<(Account, Option<(Vec<u8>, bool)>)> },
+    Uploaded(anyhow::Result<()>),
 }
 
 type SearchMsg = (u64, bool, anyhow::Result<Vec<Project>>);
@@ -110,12 +118,25 @@ pub struct SklApp {
     guard_busy: bool,
     guard_tx: mpsc::Sender<(String, crate::core::guard::Report)>,
     guard_rx: Receiver<(String, crate::core::guard::Report)>,
+    ms_account: Option<Account>,
+    /// Bumped to cancel a pending device-code login.
+    ms_gen: Arc<std::sync::atomic::AtomicU64>,
+    ms_pending: Option<Option<(String, String)>>,
+    ms_uploading: bool,
+    /// (skin_rev, slim) last examined for upload.
+    ms_checkpoint: Option<(u64, bool)>,
+    /// (skin hash, slim) that the Mojang profile is known to have.
+    ms_sent: Option<(Option<String>, bool)>,
+    ms_tx: mpsc::Sender<MsMsg>,
+    ms_rx: Receiver<MsMsg>,
 }
 
 impl SklApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let paths = Paths::init().expect("cannot create SKL data directory");
         let settings = Settings::load(&paths.settings_file());
+        crate::core::skins::use_microsoft(settings.account_mode == AccountMode::Microsoft);
+        let ms_account = Account::load(&paths.account_file());
         theme::install_text_styles(&cc.egui_ctx);
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().thread_name("skl-io").build().expect("tokio runtime");
         let logo = cc.egui_ctx.load_texture("skl_logo", ColorImage::from_rgba_unmultiplied([96, 96], &crate::icon::render(96)), TextureOptions::LINEAR);
@@ -126,6 +147,7 @@ impl SklApp {
         let (install_tx, install_rx) = mpsc::channel();
         let (guard_tx, guard_rx) = mpsc::channel();
         let (shop_tx, shop_rx) = mpsc::channel();
+        let (ms_tx, ms_rx) = mpsc::channel();
         let mut app = Self {
             view: View::Library,
             store: StoreState::default(),
@@ -173,6 +195,14 @@ impl SklApp {
             guard_busy: false,
             guard_tx,
             guard_rx,
+            ms_account,
+            ms_gen: Default::default(),
+            ms_pending: None,
+            ms_uploading: false,
+            ms_checkpoint: None,
+            ms_sent: None,
+            ms_tx,
+            ms_rx,
             paths,
         };
         app.request_versions(&cc.egui_ctx);
@@ -212,16 +242,7 @@ impl SklApp {
         if let Some(Ok(res)) = self.catalog_rx.as_ref().map(|rx| rx.try_recv()) {
             self.catalog_rx = None;
             match res {
-                Ok(list) => {
-                    // First run: give the user something to press Play on.
-                    if self.instances.is_empty() {
-                        if let Ok(inst) = instances::create(&self.paths, &list.latest_release, &list.latest_release, instances::Loader::Vanilla) {
-                            self.settings.selected_instance = Some(inst.id.clone());
-                            self.instances.push(inst);
-                        }
-                    }
-                    self.catalog = Catalog::Ready(list);
-                }
+                Ok(list) => self.catalog = Catalog::Ready(list),
                 Err(e) => {
                     self.toasts.push(ctx, Kind::Error, t(self.settings.lang, K::LoadFailed), format!("{e:#}"));
                     self.catalog = Catalog::Failed(format!("{e:#}"));
@@ -297,7 +318,14 @@ impl SklApp {
         if self.launch.as_ref().is_some_and(|l| l.progress.is_busy()) {
             return;
         }
-        if !is_valid_nickname(&self.settings.nickname) {
+        let licensed = self.settings.account_mode == AccountMode::Microsoft;
+        if licensed && self.ms_account.is_none() {
+            self.toasts.push(ctx, Kind::Error, t(lang, K::Failed), t(lang, K::MsNeedLogin));
+            self.view = View::Profile;
+            self.shop.tab = 0;
+            return;
+        }
+        if !licensed && !is_valid_nickname(&self.settings.nickname) {
             self.toasts.push(ctx, Kind::Error, t(lang, K::Failed), t(lang, K::NicknameInvalid));
             self.sheet = Some(Sheet::default());
             spring_reset(ctx, Id::new(sheet::SHEET_ID), 0.0);
@@ -307,16 +335,19 @@ impl SklApp {
         inst.last_played = Some(instances::now());
         let _ = instances::save(&self.paths, inst);
         let v = self.catalog.find(&inst.version);
-        let req = install::LaunchRequest {
+        let ms = self.ms_account.as_ref().filter(|_| licensed);
+        let mut req = install::LaunchRequest {
             id: inst.version.clone(),
             url: v.map(|v| v.url.clone()).unwrap_or_default(),
             legacy: v.map_or_else(|| crate::models::version::Era::guess(&inst.version).is_legacy(), |v| v.era.is_legacy()),
-            uuid: offline_uuid(&self.settings.nickname),
-            nickname: self.settings.nickname.clone(),
-            memory_mb: self.settings.memory_mb,
+            uuid: ms.map_or_else(|| offline_uuid(&self.settings.nickname), |a| a.dashed_uuid()),
+            nickname: ms.map_or_else(|| self.settings.nickname.clone(), |a| a.name.clone()),
+            online: None,
+            memory_mb: self.settings.memory_mb.min(crate::core::sysinfo::max_memory_mb()),
             game_dir: instances::dir(&self.paths, &inst.id),
             loader: inst.loader,
-            skin_port: self.skin_server.as_ref().map(|s| s.port()),
+            // Licensed accounts get real Mojang skins; the local skin server is for offline only.
+            skin_port: if licensed { None } else { self.skin_server.as_ref().map(|s| s.port()) },
             opts: self.settings.game.clone(),
             loader_version: inst.loader_version.clone(),
         };
@@ -338,6 +369,20 @@ impl SklApp {
                         eprintln!("backup failed: {e:#}");
                     }
                 });
+            }
+            if licensed {
+                match msauth::fresh_from_disk(&client, &paths.account_file()).await {
+                    Ok(a) => {
+                        req.uuid = a.dashed_uuid();
+                        req.nickname = a.name.clone();
+                        req.online = Some((a.mc_token, a.xuid));
+                    }
+                    Err(e) => {
+                        prog.set_stage(Stage::Failed(format!("Microsoft: {e:#}")));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
             }
             match install::run(&client, &paths, &req, &prog).await {
                 Ok(child) => {
@@ -488,7 +533,7 @@ impl SklApp {
 
     fn start_skin_server(&mut self, ctx: &egui::Context) {
         let (tx, rx) = mpsc::channel();
-        let key = crate::core::skins::dir(&self.paths).join("ygg-key.pem");
+        let key = self.paths.root().join("skins").join("ygg-key.pem");
         let ctx = ctx.clone();
         self.runtime.spawn(async move {
             let _ = tx.send(crate::core::yggdrasil::SkinServer::start(key).await);
@@ -517,6 +562,7 @@ impl SklApp {
             self.skin_tex = load("skin");
             self.cape_tex = load("cape");
         }
+        self.sync_ms_skin(ctx);
         let want = (self.settings.nickname.clone(), self.settings.skin_slim, self.skin_rev);
         if let Some(srv) = &self.skin_server {
             if self.skin_synced.as_ref() != Some(&want) {
@@ -530,6 +576,124 @@ impl SklApp {
                 self.skin_synced = Some(want);
             }
         }
+    }
+
+    fn set_account_mode(&mut self, m: AccountMode) {
+        let s = &mut self.settings;
+        if s.account_mode == m {
+            return;
+        }
+        std::mem::swap(&mut s.skin_slim, &mut s.skin_slim_alt);
+        std::mem::swap(&mut s.skin_url, &mut s.skin_url_alt);
+        s.account_mode = m;
+        crate::core::skins::use_microsoft(m == AccountMode::Microsoft);
+        self.skin_rev += 1;
+        self.ms_sent = None;
+        self.ms_checkpoint = None;
+    }
+
+    fn ms_login(&mut self, ctx: &egui::Context) {
+        let gen = self.ms_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.ms_pending = Some(None);
+        let (client, tx, live, ctx) = (self.http.clone(), self.ms_tx.clone(), self.ms_gen.clone(), ctx.clone());
+        self.runtime.spawn(async move {
+            let res = async {
+                let dc = msauth::device_code(&client).await?;
+                let _ = tx.send(MsMsg::Code { gen, code: dc.user_code.clone(), url: dc.verification_uri.clone() });
+                ctx.request_repaint();
+                let cancelled = || live.load(std::sync::atomic::Ordering::SeqCst) != gen;
+                let (access, refresh) = msauth::wait_for_user(&client, &dc, cancelled).await?;
+                let (acc, profile) = msauth::finish_login(&client, &access, refresh).await?;
+                // Show the account's own skin right away (absent = default Steve/Alex).
+                let skin = match profile.active_skin() {
+                    Some(sk) => match client.get(sk.url.replacen("http://", "https://", 1)).send().await {
+                        Ok(r) => r.bytes().await.ok().map(|b| (b.to_vec(), sk.variant.eq_ignore_ascii_case("slim"))),
+                        Err(_) => None,
+                    },
+                    None => None,
+                };
+                anyhow::Ok((acc, skin))
+            }
+            .await;
+            let _ = tx.send(MsMsg::Done { gen, res });
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_ms(&mut self, ctx: &egui::Context) {
+        let lang = self.settings.lang;
+        let live = self.ms_gen.load(std::sync::atomic::Ordering::SeqCst);
+        while let Ok(msg) = self.ms_rx.try_recv() {
+            match msg {
+                MsMsg::Code { gen, code, url } if gen == live => self.ms_pending = Some(Some((code, url))),
+                MsMsg::Done { gen, res } if gen == live => {
+                    self.ms_pending = None;
+                    match res {
+                        Ok((acc, skin)) => {
+                            if let Err(e) = acc.save(&self.paths.account_file()) {
+                                self.toasts.push(ctx, Kind::Error, t(lang, K::MsLoginFailed), format!("{e:#}"));
+                                continue;
+                            }
+                            if self.settings.account_mode == AccountMode::Microsoft {
+                                match skin {
+                                    Some((bytes, slim)) => {
+                                        if crate::core::skins::import_skin_bytes(&self.paths, bytes).is_ok() {
+                                            self.settings.skin_slim = slim;
+                                        }
+                                    }
+                                    None => crate::core::skins::clear(&self.paths, "skin"),
+                                }
+                                self.settings.skin_url = None;
+                                self.skin_rev += 1;
+                            }
+                            self.toasts.push(ctx, Kind::Success, t(lang, K::MsSignedIn), acc.name.clone());
+                            self.ms_account = Some(acc);
+                            self.ms_sent = None;
+                            self.ms_checkpoint = None;
+                        }
+                        Err(e) if format!("{e}") == "cancelled" => {}
+                        Err(e) => self.toasts.push(ctx, Kind::Error, t(lang, K::MsLoginFailed), format!("{e:#}")),
+                    }
+                }
+                MsMsg::Uploaded(res) => {
+                    self.ms_uploading = false;
+                    match res {
+                        Ok(()) => self.toasts.push(ctx, Kind::Success, t(lang, K::MsSkinUploaded), String::new()),
+                        Err(e) => self.toasts.push(ctx, Kind::Error, t(lang, K::MsSkinFailed), format!("{e:#}")),
+                    }
+                }
+                _ => {} // stale login
+            }
+        }
+    }
+
+    /// Licensed mode: push skin / model changes to the real Mojang profile.
+    fn sync_ms_skin(&mut self, ctx: &egui::Context) {
+        if self.settings.account_mode != AccountMode::Microsoft || self.ms_account.is_none() || self.ms_uploading {
+            return;
+        }
+        let want = (self.skin_rev, self.settings.skin_slim);
+        if self.ms_checkpoint == Some(want) || ctx.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        self.ms_checkpoint = Some(want);
+        let bytes = crate::core::skins::read(&self.paths, "skin");
+        let cur = (bytes.as_deref().map(crate::core::skins::hash), self.settings.skin_slim);
+        let Some(prev) = self.ms_sent.replace(cur.clone()) else { return }; // first look = baseline
+        if prev == cur {
+            return;
+        }
+        self.ms_uploading = true;
+        let (client, paths, tx, ctx, slim) = (self.http.clone(), self.paths.clone(), self.ms_tx.clone(), ctx.clone(), self.settings.skin_slim);
+        self.runtime.spawn(async move {
+            let res = async {
+                let acc = msauth::fresh_from_disk(&client, &paths.account_file()).await?;
+                msauth::set_skin(&client, &acc.mc_token, bytes, slim).await
+            }
+            .await;
+            let _ = tx.send(MsMsg::Uploaded(res));
+            ctx.request_repaint();
+        });
     }
 
     fn profile_action(&mut self, ctx: &egui::Context, a: ProfileAction) {
@@ -613,6 +777,30 @@ impl SklApp {
                 crate::core::paths::open("https://ely.by");
                 return;
             }
+            ProfileAction::OpenUrl(u) => {
+                crate::core::paths::open(u);
+                return;
+            }
+            ProfileAction::SetMode(m) => {
+                self.set_account_mode(*m);
+                return;
+            }
+            ProfileAction::MsLogin => {
+                self.ms_login(ctx);
+                return;
+            }
+            ProfileAction::MsCancel => {
+                self.ms_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.ms_pending = None;
+                return;
+            }
+            ProfileAction::MsLogout => {
+                let _ = std::fs::remove_file(self.paths.account_file());
+                self.ms_account = None;
+                self.ms_sent = None;
+                self.ms_checkpoint = None;
+                return;
+            }
             _ => {}
         }
         let pick = || rfd::FileDialog::new().add_filter("PNG", &["png"]).pick_file();
@@ -623,7 +811,12 @@ impl SklApp {
             | ProfileAction::ApplySkin(_)
             | ProfileAction::ApplyCape(_)
             | ProfileAction::Copy(_)
-            | ProfileAction::OpenEly => return,
+            | ProfileAction::OpenEly
+            | ProfileAction::OpenUrl(_)
+            | ProfileAction::SetMode(_)
+            | ProfileAction::MsLogin
+            | ProfileAction::MsCancel
+            | ProfileAction::MsLogout => return,
             ProfileAction::PickSkin => match pick() {
                 Some(f) => crate::core::skins::import_skin(&self.paths, &f).map(|slim| {
                     self.settings.skin_slim = slim;
@@ -844,6 +1037,7 @@ impl eframe::App for SklApp {
         self.poll_covers(ctx);
         self.sync_skins(ctx);
         self.poll_extras(ctx);
+        self.poll_ms(ctx);
         if std::mem::take(&mut self.guard_jump) {
             self.view = View::Mods;
             self.store.tab = 1;
@@ -876,6 +1070,10 @@ impl eframe::App for SklApp {
         let mut store_action = StoreAction::None;
         let mut profile_action = ProfileAction::None;
 
+        let shown_name = match (&self.ms_account, self.settings.account_mode) {
+            (Some(a), AccountMode::Microsoft) => a.name.clone(),
+            _ => self.settings.nickname.clone(),
+        };
         egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
             let full = ui.max_rect();
             self.wallpaper.paint(ui.painter(), full, rounding, self.settings.dim);
@@ -885,13 +1083,18 @@ impl eframe::App for SklApp {
             vgradient(ui.painter(), Rect::from_min_size(content.min, vec2(content.width() - 1.0, 90.0)), egui::Color32::from_black_alpha(110), egui::Color32::TRANSPARENT);
 
             let active = if self.sheet.is_some() { 4 } else if self.modal.is_some() { 1 } else if self.view == View::Mods { 2 } else if self.view == View::Profile { 5 } else { 0 };
-            rail_action = shell::rail(ui, &pal, rail, &self.logo, lang, active, &self.settings.nickname, self.skin_tex.as_ref());
+            rail_action = shell::rail(ui, &pal, rail, &self.logo, lang, active, &shown_name, self.skin_tex.as_ref());
             shell::top_bar(ui, &pal, Rect::from_min_size(content.min, vec2(content.width(), TOP_H)));
 
             let page = Rect::from_min_max(content.min + vec2(0.0, TOP_H), content.max - vec2(0.0, 6.0));
             ui.allocate_new_ui(UiBuilder::new().max_rect(page), |ui| {
                 if self.view == View::Profile {
-                    profile_action = profile::show(ui, &pal, lang, &mut self.settings, self.skin_tex.as_ref(), self.cape_tex.as_ref(), &mut self.shop, &mut self.skin_icons, &mut self.cape_icons);
+                    let ms = profile::MsView {
+                        account: self.ms_account.as_ref().map(|a| (a.name.clone(), a.dashed_uuid())),
+                        pending: self.ms_pending.clone(),
+                        uploading: self.ms_uploading,
+                    };
+                    profile_action = profile::show(ui, &pal, lang, &mut self.settings, self.skin_tex.as_ref(), self.cape_tex.as_ref(), &mut self.shop, &mut self.skin_icons, &mut self.cape_icons, &ms);
                 } else if self.view == View::Mods {
                     let view = StoreView {
                         instance: self.settings.selected_instance.as_deref().and_then(|id| self.instances.iter().find(|i| i.id == id)),
@@ -904,7 +1107,7 @@ impl eframe::App for SklApp {
                     store_action = store::show(ui, &pal, lang, &mut self.store, view, &mut self.icons);
                 } else {
                 let launch = self.launch.as_ref().map(|l| LaunchView { instance: &l.instance, progress: &l.progress });
-                home_action = home::show(ui, &pal, lang, &mut self.home, &self.instances, self.settings.selected_instance.as_deref(), &mut self.covers, &self.catalog, launch, &self.settings.nickname);
+                home_action = home::show(ui, &pal, lang, &mut self.home, &self.instances, self.settings.selected_instance.as_deref(), &mut self.covers, &self.catalog, launch, &shown_name);
                 }
             });
             ui.painter().rect_stroke(full.shrink(0.5), rounding, Stroke::new(1.0_f32, pal.panel_stroke));
@@ -1047,7 +1250,7 @@ impl eframe::App for SklApp {
                     }
                 }
                 DoctorAction::MoreMemory => {
-                    self.settings.memory_mb = (self.settings.memory_mb + 2048).min(16384);
+                    self.settings.memory_mb = (self.settings.memory_mb + 2048).min(crate::core::sysinfo::max_memory_mb());
                     d.fixed = true;
                 }
                 DoctorAction::DisableMod => {

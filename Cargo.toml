@@ -1,6 +1,6 @@
 [package]
 name = "skl"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "SosiskaKillerLauncher — native GPU-rendered Minecraft launcher"
 publish = false
@@ -16,7 +16,7 @@ egui = "0.29"
 
 # Async + network
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util", "time", "net"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "multipart"] }
 
 # Data
 serde = { version = "1", features = ["derive"] }

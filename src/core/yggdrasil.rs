@@ -325,7 +325,7 @@ mod tests {
         let v = list.versions.iter().find(|v| v.id == id).unwrap();
         let req = install::LaunchRequest {
             id: v.id.clone(), url: v.url.clone(), legacy: v.era.is_legacy(), nickname: "Tester".into(),
-            uuid: crate::core::auth::offline_uuid("Tester"), memory_mb: 2048,
+            uuid: crate::core::auth::offline_uuid("Tester"), online: None, memory_mb: 2048,
             game_dir: paths.instances().join(format!("test-skin-{id}")), loader: crate::core::instances::Loader::Vanilla,
             skin_port: Some(srv.port()),
             opts: Default::default(), loader_version: None,

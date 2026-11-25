@@ -270,10 +270,11 @@ fn interface(ui: &mut Ui, pal: &Palette, s: &mut Settings, lang: Lang, _: &Paths
 }
 
 fn game(ui: &mut Ui, pal: &Palette, s: &mut Settings, lang: Lang, _: &Paths, _: &Wallpaper) {
-    let mut mem = s.memory_mb as f32;
+    let max = crate::core::sysinfo::max_memory_mb() as f32;
+    let mut mem = (s.memory_mb as f32).min(max);
     let label = format!("{:.1} GB", mem / 1024.0);
     block(ui, pal, t(lang, K::Memory), t(lang, K::MemoryDesc), |ui| {
-        if slider(ui, pal, &mut mem, 1024.0, 16384.0, 512.0, &label) {
+        if slider(ui, pal, &mut mem, 1024.0, max, 512.0, &label) {
             s.memory_mb = mem as u32;
         }
     });
